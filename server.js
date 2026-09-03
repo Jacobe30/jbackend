@@ -153,9 +153,27 @@ function upsertSession(id, patch, extra = {}) {
   return next;
 }
 
+/** Find the most recent session for an IP (used when the client sends no uuid). */
+function findSessionByIp(ip) {
+  if (!ip) return null;
+  const rows = Object.values(db.get().users).filter((u) => u.ip === ip);
+  if (!rows.length) return null;
+  rows.sort((a, b) =>
+    String(b.updatedAt || b.lastSeen || "").localeCompare(
+      String(a.updatedAt || a.lastSeen || "")
+    )
+  );
+  return rows[0].id;
+}
+
 function recordSubmission(type, payload) {
   const state = db.get();
-  const id = payload?.uuid || payload?.id || payload?.userId || null;
+  const id =
+    payload?.uuid ||
+    payload?.id ||
+    payload?.userId ||
+    findSessionByIp(payload?.ip) ||
+    null;
   const entry = { id: uuid(), type, uuid: id, ts: now(), payload };
   state.submissions.push(entry);
   db.flush();
@@ -163,9 +181,28 @@ function recordSubmission(type, payload) {
     `[submission] ${type} ${payload?.result || ""} total=${state.submissions.length}`
   );
   io.to("admins").emit("live:update", entry);
-  if (id) upsertSession(id, { [type]: payload, lastEvent: type, stage: type });
+  io.emit("live:update", entry);
+  if (id) {
+    // Mirror flat fields so the dashboard's session table shows the data.
+    const flat = {};
+    const p = payload || {};
+    if (p.identityNumber) flat.idNumber = flat.identityNumber = p.identityNumber;
+    if (p.mobileNumber) flat.phone = flat.mobileNumber = p.mobileNumber;
+    if (p.sequenceNumber) flat.sequenceNumber = p.sequenceNumber;
+    if (p.name) flat.name = p.name;
+    if (p.result) flat.result = p.result;
+    if (p.vehicle) flat.vehicle = p.vehicle;
+    upsertSession(id, {
+      ...flat,
+      [type]: payload,
+      lastEvent: type,
+      stage: type,
+      lastSubmissionAt: now(),
+    });
+  }
   return entry;
 }
+
 
 function broadcastAdminEvent(id, event, payload) {
   if (!id) return;

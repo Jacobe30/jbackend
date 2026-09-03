@@ -3,7 +3,7 @@
 Proxies all REST, `/breinit`, and Socket.IO (polling + WebSocket upgrade) traffic
 to the Railway backend, and applies CORS for the allowed frontend origins.
 
-- Worker URL: `https://gosuksa-edge.gosktmin.workers.dev`
+- Worker URL: `https://gosuksa-edge.bcare.workers.dev`
 - Origin (Railway): `https://jbackend-production-dc1b.up.railway.app`
 - Frontend points at the Worker via `VITE_BACKEND_WS_URL`.
 
@@ -71,7 +71,7 @@ Wrangler prints the uploaded worker name and URL.
 ```bash
 npm run verify
 # or against another URL:
-node scripts/verify.mjs https://gosuksa-edge.gosktmin.workers.dev
+node scripts/verify.mjs https://gosuksa-edge.bcare.workers.dev
 ```
 
 It checks four things:
@@ -85,8 +85,8 @@ It checks four things:
 Manual equivalents:
 
 ```bash
-curl -i https://gosuksa-edge.gosktmin.workers.dev/breinit
-curl -i -X OPTIONS https://gosuksa-edge.gosktmin.workers.dev/breinit \
+curl -i https://gosuksa-edge.bcare.workers.dev/breinit
+curl -i -X OPTIONS https://gosuksa-edge.bcare.workers.dev/breinit \
   -H 'Origin: https://gosuksa-tmin.lovable.app' \
   -H 'Access-Control-Request-Method: POST'
 ```

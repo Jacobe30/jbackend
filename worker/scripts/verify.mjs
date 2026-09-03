@@ -1,5 +1,5 @@
 // Post-deploy smoke test: node scripts/verify.mjs [worker-url]
-const base = process.argv[2] || "https://gosuksa-edge.gosktmin.workers.dev";
+const base = process.argv[2] || "https://gosuksa-edge.bcare.workers.dev";
 const origin = "https://gosuksa-tmin.lovable.app";
 
 async function check(label, run) {

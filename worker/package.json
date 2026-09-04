@@ -13,6 +13,7 @@
     "verify": "node scripts/verify.mjs"
   },
   "devDependencies": {
+    "socket.io-client": "^4.8.3",
     "wrangler": "^3.90.0"
   }
 }

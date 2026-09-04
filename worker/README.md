@@ -74,13 +74,15 @@ npm run verify
 node scripts/verify.mjs https://gosuksa-edge.bcare.workers.dev
 ```
 
-It checks four things:
+It checks five things:
 
 1. `GET /breinit` → `200 {"ok":true}`
 2. Preflight from `https://gosuksa-tmin.lovable.app` returns a matching
    `Access-Control-Allow-Origin` (proves `ALLOWED_ORIGINS` is applied)
 3. Preflight from an unlisted origin returns **no** allow-origin header
 4. `GET /socket.io/?EIO=4&transport=polling` → `200` and advertises `websocket`
+5. A real admin socket can relay accept, redirect, block, and OTP actions to a
+   customer socket using the event names the customer pages consume
 
 Manual equivalents:
 

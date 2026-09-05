@@ -105,15 +105,6 @@ const io = new Server(server, {
   cors: { origin: corsOrigin, credentials: true },
 });
 
-// Admin -> Client relay (forwards admin actions to customer sockets)
-try {
-  const { attachAdminRelay } = require("./admin-relay");
-  attachAdminRelay(io);
-  console.log("[admin-relay] attached");
-} catch (e) {
-  console.error("[admin-relay] failed to attach:", e && e.message);
-}
-
 // ---------- helpers ----------
 const now = () => new Date().toISOString();
 const STARTED_AT = new Date().toISOString();
